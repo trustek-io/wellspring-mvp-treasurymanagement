@@ -1,0 +1,48 @@
+name: SST PROD workflow
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+# Concurrency group name ensures concurrent workflow runs wait for any in-progress job to finish
+concurrency:
+  group: merge-${{ github.ref }}
+
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: read # This is required for actions/checkout
+
+jobs:
+  DeployApp:
+    runs-on: ubuntu-latest
+    env:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+    steps:
+      - name: Git clone the repository
+        uses: actions/checkout@v3
+        with:
+          lfs: true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::767397681508:role/GitHub
+          role-duration-seconds: 14390 #adjust as needed for your build time
+          aws-region: us-east-1
+
+      - name: Install dependencies
+        run: pnpm install
+
+
+      - name: Deploy app
+        run: pnpm exec sst deploy --stage production
