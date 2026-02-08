@@ -15,6 +15,7 @@ import { TurnkeyBrowserClient } from "@turnkey/sdk-browser"
 import { useTurnkey } from "@turnkey/sdk-react"
 import { useUser } from "@/hooks/use-user"
 import { useWallets } from "@/providers/wallet-provider"
+import { useLDFlags } from "@/providers/launchdarkly-dashboard-provider"
 import {
     createSponsoredSmartAccount,
     getSmartAccountInfo,
@@ -105,6 +106,10 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
     const { state: walletState } = useWallets()
     const { indexedDbClient: client } = useTurnkey()
 
+    // Get LaunchDarkly flags for auto-deposit control
+    const { flags, isReady: ldReady } = useLDFlags()
+    const isAutoDepositEnabled = flags.autoDepositEnabled ?? true // Default to true if flag not set
+
     // Single shared manager
     const manager = useMemo(() => getCrossChainManager(), [])
     const [managerReady, setManagerReady] = useState(false)
@@ -113,9 +118,17 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
     const automationRunningRef = useRef(false)
     const automationDoneRef = useRef(false)
 
-// Optional: expose a manual trigger later if needed
+    // Optional: expose a manual trigger later if needed
     const runAutomation = useCallback(async () => {
         if (automationRunningRef.current || automationDoneRef.current) return
+
+        // Check if auto-deposit is enabled via LaunchDarkly
+        if (!isAutoDepositEnabled) {
+            console.log("🚫 Auto-deposit is disabled via LaunchDarkly flag")
+            automationDoneRef.current = true // Mark as done to prevent retries
+            return
+        }
+
         automationRunningRef.current = true
         try {
             // Preconditions
@@ -123,6 +136,8 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
             if (!state.smartAccountInfo?.address) return
             if (!walletState.selectedAccount?.address) return
             if (!client || !subOrgId) return
+
+            console.log("🤖 Auto-deposit enabled, running automation...")
 
             // 1) If EOA has USDC, push it to the Smart Account
             const eoaUSDC = walletState.selectedAccount.usdcBalance ?? 0n
@@ -166,7 +181,7 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
         } finally {
             automationRunningRef.current = false
         }
-    }, [managerReady, state.smartAccountInfo?.address, walletState.selectedAccount?.address, client, subOrgId, manager])
+    }, [managerReady, state.smartAccountInfo?.address, walletState.selectedAccount?.address, client, subOrgId, manager, isAutoDepositEnabled])
 
 
     // reentrancy guard
@@ -187,12 +202,6 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
                 const { getSignerFromZeroDevProvider } = await import("@/lib/session-key-utils")
                 const signer = await getSignerFromZeroDevProvider(user, walletState, client)
 
-                // const signer = await getTurnkeySignerForZeroDev(
-                //     client as TurnkeyBrowserClient,
-                //     walletState.selectedAccount.address,
-                //     subOrgId
-                // )
-
                 const sa = await createSponsoredSmartAccount({ signer, sponsorGas: true })
                 dispatch({ type: "SET_SMART_ACCOUNT", payload: sa })
 
@@ -200,13 +209,13 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
                 dispatch({ type: "SET_SMART_INFO", payload: info })
             }
         } catch (e: any) {
-            dispatch({ type: "SET_ERROR", payload: e?.message || "Smart account error" })
+            dispatch({ type: "SET_ERROR", payload: e instanceof Error ? e.message : "Smart account error" })
             dispatch({ type: "SET_STATUS", payload: SMART_ACCOUNT_STATUS.ERROR })
         } finally {
             inflight.current.smart = false
             dispatch({ type: "SET_LOADING", payload: { field: "isCreatingAccount", value: false } })
         }
-    }, [client, walletState.selectedAccount, subOrgId, state.smartAccount])
+    }, [client, walletState.selectedAccount, subOrgId, state.smartAccount, user, walletState])
 
     const ensureSessionKeys = useCallback(async () => {
         if (inflight.current.sk) return
@@ -218,12 +227,6 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
 
             const { getSignerFromZeroDevProvider } = await import("@/lib/session-key-utils")
             const signer = await getSignerFromZeroDevProvider(user, walletState, client)
-
-            // const signer = await getTurnkeySignerForZeroDev(
-            //     client as TurnkeyBrowserClient,
-            //     walletState.selectedAccount.address,
-            //     subOrgId
-            // )
 
             // Idempotent manager setup (reuses existing keys if present)
             await manager.setupForChains(
@@ -237,11 +240,11 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
             setManagerReady(manager.isReady(["arbitrum", "hyperevm"]))
 
         } catch (e: any) {
-            dispatch({ type: "SET_ERROR", payload: e?.message || "Session key setup failed" })
+            dispatch({ type: "SET_ERROR", payload: e instanceof Error ? e.message : "Session key setup failed" })
         } finally {
             inflight.current.sk = false
         }
-    }, [client, walletState.selectedAccount, subOrgId, state.smartAccountInfo?.address, manager])
+    }, [client, walletState.selectedAccount, subOrgId, state.smartAccountInfo?.address, manager, user, walletState])
 
     // --- Auto-boot when everything needed is present ---
     useEffect(() => {
@@ -261,10 +264,11 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
 
     useEffect(() => {
         // Run when everything is ready; idempotent via refs
-        if (managerReady && state.smartAccountInfo?.address && walletState.selectedAccount?.address && client && subOrgId) {
+        // Also wait for LaunchDarkly to be ready before making the decision
+        if (managerReady && state.smartAccountInfo?.address && walletState.selectedAccount?.address && client && subOrgId && ldReady) {
             runAutomation()
         }
-    }, [managerReady, state.smartAccountInfo?.address, walletState.selectedAccount?.address, client, subOrgId, runAutomation])
+    }, [managerReady, state.smartAccountInfo?.address, walletState.selectedAccount?.address, client, subOrgId, runAutomation, ldReady])
 
 
     const refreshBalances = useCallback(async () => {
@@ -277,7 +281,7 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
             )
             dispatch({ type: "SET_SMART_INFO", payload: info })
         } catch (e: any) {
-            dispatch({ type: "SET_ERROR", payload: e?.message || "Refresh balances failed" })
+            dispatch({ type: "SET_ERROR", payload: e instanceof Error ? e.message : "Refresh balances failed" })
         } finally {
             dispatch({ type: "SET_LOADING", payload: { field: "isLoadingBalance", value: false } })
         }
@@ -291,7 +295,7 @@ export function ZeroDevProvider({ children }: { children: ReactNode }) {
             await refreshBalances()
             return hash
         } catch (e: any) {
-            dispatch({ type: "SET_ERROR", payload: e?.message || "Test TX failed" })
+            dispatch({ type: "SET_ERROR", payload: e instanceof Error ? e.message : "Test TX failed" })
             return null
         } finally {
             dispatch({ type: "SET_LOADING", payload: { field: "isSendingTransaction", value: false } })
